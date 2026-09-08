@@ -13,6 +13,7 @@ import pytest
 from nemo_retriever.common.vdb.adt_vdb import (
     CollectionWriteContext,
     CollectionWriteResult,
+    UnsupportedVDBOperation,
     VDB,
 )
 from nemo_retriever.common.vdb.records import RetrievalContractError, VdbUploadError
@@ -618,25 +619,59 @@ def test_put_operator_delegates_records_with_configured_key_and_table_name() -> 
     ]
 
 
-def test_batch_put_is_not_classified_as_bounded_ingest_sink(tmp_path) -> None:
-    operator = PutVdbOperator(
-        vdb_op="lancedb",
-        vdb_kwargs={"uri": str(tmp_path), "table_name": "entities"},
-    )
-    graph = Graph() >> operator
+def test_custom_vdb_stream_capability_and_legacy_fallback() -> None:
+    pulls: list[int] = []
 
-    assert RayDataExecutor._bounded_vdb_sink_index(RayDataExecutor._linearize(graph)) is None
+    class StreamingFakeVDB(FakeVDB):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stream_records: list[dict[str, Any]] = []
 
+        def stream_ingest(self, records, **kwargs):
+            assert pulls == []
+            assert not isinstance(records, (list, tuple, pd.DataFrame))
+            self.stream_records = list(records)
+            return {"written": len(self.stream_records)}
 
-def test_bounded_sink_capability_keeps_backend_detection_in_operator(tmp_path) -> None:
-    custom = IngestVdbOperator(vdb=FakeVDB())
-    lancedb = IngestVdbOperator(
-        vdb_op="lancedb",
-        vdb_kwargs={"uri": str(tmp_path), "table_name": "chunks"},
-    )
+    class EarlyReturningVDB(FakeVDB):
+        def stream_ingest(self, records, **kwargs):
+            next(iter(records))
 
-    assert custom.supports_bounded_sink() is False
-    assert lancedb.supports_bounded_sink() is True
+    def batches():
+        pulls.append(0)
+        yield pd.DataFrame([_graph_rows()[0]])
+        pulls.append(1)
+        yield pd.DataFrame([_graph_rows()[1]])
+
+    streaming_vdb = StreamingFakeVDB()
+    streaming = IngestVdbOperator(vdb=streaming_vdb)
+    legacy_vdb = FakeVDB()
+    legacy = IngestVdbOperator(vdb=legacy_vdb)
+    put = PutVdbOperator(vdb=streaming_vdb)
+
+    assert streaming.supports_stream_ingest() is True
+    assert RayDataExecutor._stream_ingest_index(RayDataExecutor._linearize(Graph() >> streaming)) == 0
+    assert legacy.supports_stream_ingest() is False
+    assert legacy.REQUIRES_GLOBAL_BATCH is True
+    assert RayDataExecutor._stream_ingest_index(RayDataExecutor._linearize(Graph() >> legacy)) is None
+    assert put.supports_stream_ingest() is False
+    assert RayDataExecutor._stream_ingest_index(RayDataExecutor._linearize(Graph() >> put)) is None
+
+    assert streaming.stream_ingest(batches()) == {"written": 2}
+    assert pulls == [0, 1]
+    assert streaming_vdb.run_calls == []
+    assert [record["document_type"] for record in streaming_vdb.stream_records] == ["text", "text"]
+    assert [record["metadata"]["content"] for record in streaming_vdb.stream_records] == [
+        "first chunk",
+        "second chunk",
+    ]
+
+    legacy.process(pd.DataFrame(_graph_rows()))
+    assert len(legacy_vdb.run_calls) == 1
+    with pytest.raises(UnsupportedVDBOperation, match="does not implement stream_ingest"):
+        legacy.stream_ingest(batches())
+    with pytest.raises(RuntimeError, match="returned before consuming the record stream"):
+        IngestVdbOperator(vdb=EarlyReturningVDB()).stream_ingest([pd.DataFrame(_graph_rows())])
 
 
 def test_put_operator_merges_sidecar_metadata_into_records_before_put() -> None:

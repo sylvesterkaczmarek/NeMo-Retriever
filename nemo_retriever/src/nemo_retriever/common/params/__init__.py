@@ -33,7 +33,6 @@ from nemo_retriever.common.params.models import TableParams
 from nemo_retriever.common.params.models import TextChunkParams
 from nemo_retriever.common.params.models import TextGenerationParams
 from nemo_retriever.common.params.models import MetaJoinKey
-from nemo_retriever.common.params.models import VdbSinkParams
 from nemo_retriever.common.params.models import VdbUploadParams
 from nemo_retriever.common.params.models import VideoFrameParams
 from nemo_retriever.common.params.models import VideoFrameTextDedupParams
@@ -75,7 +74,6 @@ __all__ = [
     "TextChunkParams",
     "TextGenerationParams",
     "MetaJoinKey",
-    "VdbSinkParams",
     "VdbUploadParams",
     "VideoFrameParams",
     "VideoFrameTextDedupParams",

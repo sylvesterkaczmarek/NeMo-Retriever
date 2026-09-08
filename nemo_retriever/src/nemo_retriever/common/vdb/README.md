@@ -26,13 +26,23 @@ physical names, schemas, native ranking fields, locks, and persistence. LanceDB
 initializes its private collection catalog lazily, so ordinary fixed-table
 construction and the existing CLI paths do not create collection metadata.
 
+`VDB.stream_ingest(records)` is an optional, non-abstract capability for batch
+ingest. It receives a lazy iterable of canonical NeMo Retriever Library record
+dictionaries. The iterable does not contain Ray, pandas, Arrow, or
+backend-specific objects. An implementation must consume it exactly once,
+synchronously, and to exhaustion before returning; it must not retain the
+iterable.
+Existing `VDB` subclasses remain compatible because the inherited method raises
+`UnsupportedVDBOperation`. `IngestVdbOperator` detects whether a backend
+overrides the method before selecting the streaming path.
+
 ---
 
 ## `IngestVdbOperator` (ingestion)
 
 ### Role
 
-`IngestVdbOperator` adapts **flat graph / DataFrame rows** (the shape produced after extract → embed in NeMo Retriever) into the **nested ingestion-pipeline record batches** expected by client VDBs. Legacy calls use **`VDB.run(records)`** once per batch; an explicit `CollectionWriteContext` dispatches to **`VDB.write_collection(records, context=...)`**.
+`IngestVdbOperator` adapts **flat graph / DataFrame rows** (the shape produced after extract → embed in NeMo Retriever) into the canonical records expected by client VDBs. Legacy calls use **`VDB.run(records)`** once per batch; an explicit `CollectionWriteContext` dispatches to **`VDB.write_collection(records, context=...)`**.
 
 Flow (see `operators/vdb.py` and `common/vdb/records.py`):
 
@@ -40,18 +50,39 @@ Flow (see `operators/vdb.py` and `common/vdb/records.py`):
 2. Optional **sidecar metadata** — if `vdb_kwargs` contains `meta_dataframe` / `meta_source_field` / `meta_fields`, those keys are stripped for the concrete DB constructor and merged onto records via `sidecar_metadata.py`.
 3. **Explicit dispatch** — calls `VDB.run(records)` for fixed-table ingestion or `VDB.write_collection(records, context=...)` for a scoped collection.
 
+For streaming batch ingest, `IngestVdbOperator.stream_ingest(batches)` converts
+each graph row lazily, applies the same sidecar metadata, and delegates one
+canonical record iterable to `VDB.stream_ingest(records)`. Canonical conversion
+stays in the operator, while the backend owns its write lifecycle.
+
 ### Ray batch pipelines (`RayDataExecutor`)
 
-Graph ingestion with `run_mode=batch` uses **`RayDataExecutor`** (`nemo_retriever/graph/executor.py`), which walks the linear graph and, for each node, appends a Ray Data **`map_batches`** stage.
+Graph ingestion with `run_mode=batch` uses **`RayDataExecutor`**
+(`nemo_retriever/graph/executor.py`). `RayDataExecutor.ingest()` selects the
+streaming path when the graph has one eligible `IngestVdbOperator` whose backend
+overrides `VDB.stream_ingest()`.
 
-`IngestVdbOperator` declares **`REQUIRES_GLOBAL_BATCH = True`**. When the executor sees that flag on a node’s operator class it:
+On that path, the executor owns Ray batch iteration, prefetch, iterator cleanup,
+retention of the historical pandas result, and downstream ordering. The
+operator converts those batches into canonical records before the backend sees
+them. The executor does not import LanceDB or pass Ray objects across the VDB
+interface.
 
-1. **Repartitions the dataset immediately before that stage** so the upstream `Dataset` is coalesced for this operator — by default **`ds.repartition(num_blocks=1)`**, i.e. a **single Ray Data block** holding **all rows** (the same pattern used for other global operators such as `AudioVisualFuser` and `VideoFrameTextDedup`). If the class instead defines **`GLOBAL_BATCH_GROUP_KEYS`** and **`concurrency > 1`**, the executor may repartition by those keys with multiple blocks; `IngestVdbOperator` does **not** use that path, so it always gets **one block**.
-2. Sets **`batch_size=None`** for that `map_batches` call so Ray passes the **entire block** as **one pandas batch** to the operator.
+Backends that inherit the default `VDB.stream_ingest()` implementation retain
+the historical global-batch path. `IngestVdbOperator.REQUIRES_GLOBAL_BATCH`
+causes the complete dataset to be repartitioned to one block before
+`VDB.run(records)` executes. `PutVdbOperator` explicitly opts out of streaming
+so its update-only semantics remain on that path.
 
-Together, repartition + full batch mean **`process()`** receives **every row at once**, **`to_client_vdb_records`** builds one combined batch list, and **`VDB.run(records)`** runs **once** over the full ingest output — matching the historical “post-graph, single upload” behavior while keeping upload **inside** the graph.
+The public `RayDataExecutor.build_dataset()` method also retains its historical
+behavior. It returns the full lazy graph, including the global VDB stage, and
+does not perform streaming ingest. Call `RayDataExecutor.ingest()` to use the
+streaming optimization and materialize the result.
 
-**In-process** execution (`InprocessExecutor`) does not use Ray Data; it already runs each operator on the **whole** `DataFrame`, so no repartition step is needed.
+In-process execution and service execution do not select this streaming path.
+They continue through `IngestVdbOperator.process()` and its existing VDB
+dispatch. Streaming selection is an automatic backend capability check, not a
+generic ingest-time setting.
 
 ### Wiring ingestion today
 
@@ -86,12 +117,19 @@ retriever ingest /data/pdfs \
 
 When `vdb_op="lancedb"` (or `vdb=LanceDB(...)` is passed explicitly), `_construct_vdb` instantiates **`LanceDB`** with the **clean** constructor kwargs (sidecar keys removed).
 
-### `LanceDB.run` (ingestion path)
+### LanceDB ingestion paths
 
-`LanceDB.run` (in `lancedb.py`) orchestrates:
+`LanceDB.run` (in `lancedb.py`) remains the direct, in-process, and
+legacy-fallback fixed-table ingestion path. It orchestrates:
 
 1. **`create_index`** — connects with `lancedb.connect(self.uri)`, transforms ingestion batches into Arrow rows (`vector`, `text`, `metadata`, `source`), and **`db.create_table(...)`** with schema and `on_bad_vectors` policy.
 2. **`write_to_index`** — builds the **vector index** (e.g. IVF/HNSW) and optionally an **FTS/BM25** index over the ingested `text` column when `hybrid=True`.
+
+`LanceDB.stream_ingest` is the first-class bounded implementation of the
+optional VDB capability. It receives canonical record dictionaries and owns
+Arrow packing and schemas, the byte limit, one table mutation, durable operation
+tags, retry and version validation, index coverage, and optional optimization.
+Ray remains responsible only for producing and retaining ordered input batches.
 
 Common constructor arguments include:
 
@@ -104,6 +142,9 @@ Common constructor arguments include:
 | `index_type` / `metric` / `num_partitions` / `num_sub_vectors` | Vector index tuning |
 | `hybrid`        | Also build the LanceDB FTS/BM25 index on ingested `text` |
 | `on_bad_vectors`| `drop`, `fill`, `null`, or `error` |
+| `stream_batch_bytes` | Maximum Arrow bytes per packed streaming batch (default 256 MiB) |
+| `stream_optimize` | Run LanceDB optimization after a streaming write (default `False`) |
+| `stream_operation_id` | Optional stable operation ID for retry and recovery; generated when omitted |
 
 ---
 
@@ -263,7 +304,7 @@ flowchart LR
     G[Graph rows / DataFrame]
     IVO[IngestVdbOperator]
     R1[to_client_vdb_records]
-    L1[LanceDB.run]
+    L1[LanceDB.run / stream_ingest]
     G --> IVO --> R1 --> L1
   end
 
@@ -279,7 +320,7 @@ flowchart LR
   L2 -->[(same table)]
 ```
 
-- **Ingest**: flat rows → ingestion batches → **`LanceDB.run`** → table + indexes.
+- **Ingest**: flat rows → canonical records → **`LanceDB.run`** or **`LanceDB.stream_ingest`** → table + indexes.
 - **Retrieve**: strings → vectors → **`RetrieveVdbOperator`** → **`LanceDB.retrieval`** → hit lists.
 
-For implementation details, see `operators.py`, `lancedb.py`, `records.py`, `factory.py`, and `retriever.py`.
+For implementation details, see `operators/vdb.py`, `adt_vdb.py`, `lancedb.py`, `sink.py`, `records.py`, `factory.py`, and `retriever.py`.

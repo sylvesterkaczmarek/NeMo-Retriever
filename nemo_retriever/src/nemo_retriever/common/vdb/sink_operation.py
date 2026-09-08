@@ -81,7 +81,7 @@ class SinkOperationMarkers:
         if foreign_incomplete:
             raise VdbOperationConflict(
                 "The LanceDB table has an unfinished bounded-sink operation; "
-                "retry or reconcile that operation before starting another write."
+                "retry the original operation with its original stream_operation_id before starting another write."
             )
         operation_tags = [name for name in tags if markers._operation_fragment in name]
         current_request_tags = [name for name in operation_tags if markers._request_token in name]

@@ -2,12 +2,11 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded, single-commit ingestion for the Ray Data VDB boundary.
+"""Bounded, single-commit ingestion for the LanceDB backend.
 
-This module deliberately owns the entire stream-to-Lance lifecycle.  Ray
-blocks are inputs, not transactions: one coordinator projects them to the
-stored schema, emits byte-bounded Arrow batches, performs one Lance data
-mutation, validates it, and only then builds the requested indexes.
+This module owns the canonical-record-to-Lance lifecycle: it projects NRL
+records to the stored schema, emits byte-bounded Arrow batches, performs one
+Lance data mutation, validates it, and only then builds the requested indexes.
 """
 
 from __future__ import annotations
@@ -18,9 +17,7 @@ import math
 import pickle
 import struct
 import tempfile
-import time
-from collections import Counter
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,63 +33,6 @@ from nemo_retriever.common.vdb.sink_operation import (
 _CREATE_OPERATION_KEY = b"nemo_retriever.sink_create_operation_sha256"
 _CREATE_REQUEST_KEY = b"nemo_retriever.sink_create_request_sha256"
 _MAX_PENDING_CANONICAL_ROWS = 256
-_TIMING_PHASES = (
-    "prepare",
-    "write",
-    "time_to_data_commit",
-    "validate",
-    "vector_index",
-    "fts_index",
-    "index",
-    "optimize",
-    "total",
-)
-
-
-@dataclass(frozen=True, slots=True)
-class VdbSinkPolicy:
-    """Memory and read-ahead policy for one Ray Data VDB sink operation."""
-
-    max_batch_bytes: int = 256 << 20
-    prefetch_batches: int = 1
-    optimize: bool = False
-
-    def __post_init__(self) -> None:
-        if isinstance(self.max_batch_bytes, bool) or int(self.max_batch_bytes) <= 0:
-            raise ValueError("max_batch_bytes must be a positive integer")
-        if isinstance(self.prefetch_batches, bool) or int(self.prefetch_batches) < 0:
-            raise ValueError("prefetch_batches must be a non-negative integer")
-
-
-@dataclass(frozen=True, slots=True)
-class VdbWriteReport:
-    """Observable result of one completed VDB sink lifecycle."""
-
-    operation_id: str
-    outcome: str
-    configured_max_batch_bytes: int
-    configured_prefetch_batches: int
-    input_batches: int
-    input_rows: int
-    input_bytes: int
-    max_input_batch_bytes: int
-    output_batches: int
-    rows_written: int
-    logical_bytes: int
-    max_batch_bytes: int
-    max_pending_rows: int
-    versions_before: int
-    versions_after: int
-    fragments_before: int
-    fragments_after: int
-    data_files_before: int
-    data_files_after: int
-    write_rows_per_second: float
-    write_bytes_per_second: float
-    data_version: int | None
-    final_version: int | None
-    timings: dict[str, float]
-    terminal_result_bytes: int | None = None
 
 
 class OversizedVdbRowError(ValueError):
@@ -111,7 +51,7 @@ def assert_lancedb_table_ready(table: Any) -> None:
     if incomplete:
         raise VdbWriteNotFinalized(
             f"LanceDB table {table.name!r} has a data write that is not finalized; "
-            "retry or reconcile the original VDB sink operation before reading."
+            "retry the original operation with its original stream_operation_id before reading."
         )
 
     if not _bounded_create_is_finalized(table):
@@ -140,16 +80,8 @@ def _bounded_create_is_finalized(table: Any) -> bool:
 
 @dataclass(slots=True)
 class _StreamStats:
-    input_batches: int = 0
-    input_rows: int = 0
-    input_bytes: int = 0
-    max_input_batch_bytes: int = 0
     client_records: int = 0
-    output_batches: int = 0
     rows_written: int = 0
-    logical_bytes: int = 0
-    max_batch_bytes: int = 0
-    max_pending_rows: int = 0
     canonical_hash_sum: int = 0
     canonical_hash_xor: int = 0
     vector_dim: int | None = None
@@ -358,10 +290,7 @@ def _checked_batches(
             yield from emit(candidate[:midpoint])
             yield from emit(candidate[midpoint:])
             return
-        stats.logical_bytes += retained_bytes
         _record_canonical_batch(stats, batch)
-        stats.max_batch_bytes = max(stats.max_batch_bytes, retained_bytes)
-        stats.output_batches += 1
         yield batch
 
     for row in rows:
@@ -380,185 +309,39 @@ def _checked_batches(
             estimated_bytes = 0
         pending.append(row)
         estimated_bytes += row_estimate
-        stats.max_pending_rows = max(stats.max_pending_rows, len(pending))
     if pending:
         yield from emit(pending)
 
 
-def _iter_rows(batch: Any) -> Iterator[dict[str, Any]]:
-    """Yield graph rows without copying a complete Ray block to Python dicts."""
-
-    if isinstance(batch, (pa.Table, pa.RecordBatch)):
-        for row_index in range(batch.num_rows):
-            # Arrow slices share the source buffers; only the current row is
-            # converted to Python-owned values.
-            yield batch.slice(row_index, 1).to_pylist()[0]
-        return
-
-    columns = getattr(batch, "columns", None)
-    itertuples = getattr(batch, "itertuples", None)
-    if columns is not None and callable(itertuples):
-        names = list(columns)
-        for values in itertuples(index=False, name=None):
-            yield dict(zip(names, values))
-        return
-
-    if isinstance(batch, Mapping):
-        yield dict(batch)
-        return
-
-    for row in batch or ():
-        if isinstance(row, Mapping):
-            yield dict(row)
-
-
-def _input_batch_bytes(batch: Any) -> int:
-    """Measure the retained bytes of one incoming Ray-native batch."""
-
-    if isinstance(batch, (pa.Table, pa.RecordBatch)):
-        return int(batch.get_total_buffer_size())
-    memory_usage = getattr(batch, "memory_usage", None)
-    if callable(memory_usage):
-        usage = memory_usage(index=True, deep=True)
-        return int(usage.sum())
-    return 0
-
-
-def _empty_conversion_error(
-    *,
-    rows: int,
-    upstream_error_fields: Counter[str],
-    upstream_error_count: int,
-    rejection_reasons: Counter[str],
-) -> Exception:
-    """Build the existing payload-free VDB conversion error from counters."""
-
-    from nemo_retriever.common.vdb.records import VdbUploadError
-
-    if upstream_error_count:
-        summary = ", ".join(f"{field}={count}" for field, count in sorted(upstream_error_fields.items()))
-        return VdbUploadError(
-            f"vdb_upload received {rows} row(s), but none were uploadable because upstream stages "
-            f"reported {upstream_error_count} structured row error(s) ({summary}); "
-            "error payloads are omitted because they may contain sensitive data."
-        )
-
-    summary = ", ".join(f"{reason}={count}" for reason, count in sorted(rejection_reasons.items()))
-    if "missing embedding" in rejection_reasons:
-        return VdbUploadError(
-            "vdb_upload requires embedded records, but no embeddings were found. "
-            f"Received {rows} nonempty row(s); rejection reasons: {summary}. "
-            "Add an embed stage or provide a supported embedding column."
-        )
-    return VdbUploadError(f"vdb_upload received {rows} row(s), but none were uploadable; rejection reasons: {summary}.")
-
-
-def _canonical_rows(
-    batches: Iterable[Any],
+def _lancedb_rows(
+    records: Iterable[dict[str, Any]],
     *,
     vdb: Any,
-    sidecar_spec: dict[str, Any] | None,
-    sidecar_lookup: dict[str, dict[str, Any]] | None,
     stats: _StreamStats,
 ) -> Iterator[dict[str, Any]]:
-    """Project graph batches to the exact rows used by the legacy backend."""
+    """Project individual canonical NRL records to LanceDB storage rows."""
 
-    from nemo_retriever.common.stage_errors import iter_stage_errors_from_value
     from nemo_retriever.common.vdb.lancedb import (
         _create_lancedb_results,
         _create_sparse_lancedb_results,
         _to_service_lancedb_rows,
     )
-    from nemo_retriever.common.vdb.records import (
-        VdbUploadError,
-        _client_record_from_graph_row,
-        _row_has_uploadable_content_without_embedding,
-        _stage_error_field,
-    )
-    from nemo_retriever.common.vdb.sidecar_metadata import (
-        apply_sidecar_metadata_to_client_batches,
-    )
 
-    deferred_error: VdbUploadError | None = None
-    for batch in batches:
-        stats.input_batches += 1
-        input_bytes = _input_batch_bytes(batch)
-        stats.input_bytes += input_bytes
-        stats.max_input_batch_bytes = max(stats.max_input_batch_bytes, input_bytes)
-        batch_rows = 0
-        batch_client_records = 0
-        upstream_error_fields: Counter[str] = Counter()
-        upstream_error_count = 0
-        rejection_reasons: Counter[str] = Counter()
+    for record in records:
+        if not isinstance(record, dict):
+            raise TypeError("stream_ingest records must be individual canonical NRL record dictionaries")
 
-        # Preserve the legacy nested-client-record input accepted by
-        # ``to_client_vdb_records`` without materializing graph rows.
-        if isinstance(batch, list) and all(isinstance(record_batch, list) for record_batch in batch):
-            record_iter = (record for record_batch in batch for record in record_batch if isinstance(record, dict))
+        stats.client_records += 1
+        record_batches = [[record]]
+        if vdb.sparse:
+            canonical, _counts = _create_sparse_lancedb_results(record_batches)
         else:
-
-            def converted_records(
-                input_batch: Any = batch,
-                error_fields: Counter[str] = upstream_error_fields,
-                rejections: Counter[str] = rejection_reasons,
-            ) -> Iterator[dict[str, Any]]:
-                nonlocal batch_rows, upstream_error_count
-                for graph_row in _iter_rows(input_batch):
-                    batch_rows += 1
-                    stats.input_rows += 1
-                    record = _client_record_from_graph_row(graph_row)
-                    if record is not None:
-                        yield record
-                        continue
-
-                    upstream_errors = list(iter_stage_errors_from_value(graph_row))
-                    if upstream_errors:
-                        upstream_error_count += len(upstream_errors)
-                        error_fields.update(_stage_error_field(error.get("path")) for error in upstream_errors)
-                    else:
-                        reason = (
-                            "missing embedding"
-                            if _row_has_uploadable_content_without_embedding(graph_row)
-                            else "missing searchable text or image backing"
-                        )
-                        rejections[reason] += 1
-
-            record_iter = converted_records()
-
-        for record in record_iter:
-            batch_client_records += 1
-            stats.client_records += 1
-            records = [[record]]
-            if sidecar_spec is not None and sidecar_lookup is not None:
-                records = apply_sidecar_metadata_to_client_batches(
-                    records,
-                    lookup=sidecar_lookup,
-                    meta_fields=sidecar_spec["meta_fields"],
-                    join_key=sidecar_spec["meta_join_key"],
-                )
-
-            if vdb.sparse:
-                canonical, _counts = _create_sparse_lancedb_results(records)
-            else:
-                enforce_dim = vdb.validate_vector_length and vdb.on_bad_vectors != "error"
-                expected_dim = stats.vector_dim if enforce_dim else None
-                canonical, _counts = _create_lancedb_results(records, expected_dim=expected_dim)
-                if vdb._service_table_schema:
-                    canonical = _to_service_lancedb_rows(canonical)
-            yield from canonical
-
-        if batch_rows and batch_client_records == 0 and deferred_error is None:
-            deferred_error = _empty_conversion_error(
-                rows=batch_rows,
-                upstream_error_fields=upstream_error_fields,
-                upstream_error_count=upstream_error_count,
-                rejection_reasons=rejection_reasons,
-            )
-
-    # Preserve the global conversion invariant: invalid partitions do not
-    # fail an operation that produced uploadable rows elsewhere.
-    if stats.client_records == 0 and deferred_error is not None:
-        raise deferred_error
+            enforce_dim = vdb.validate_vector_length and vdb.on_bad_vectors != "error"
+            expected_dim = stats.vector_dim if enforce_dim else None
+            canonical, _counts = _create_lancedb_results(record_batches, expected_dim=expected_dim)
+            if vdb._service_table_schema:
+                canonical = _to_service_lancedb_rows(canonical)
+        yield from canonical
 
 
 def _infer_vector_dim_with_spooled_prefix(
@@ -648,9 +431,8 @@ def _apply_deferred_bad_vector_policy(
             vector_values = vector
         elif isinstance(vector, np.ndarray) and vector.ndim == 1:
             # Pinned LanceDB accepts one-dimensional NumPy arrays as nested
-            # Python vectors. Other merely iterable containers (for example,
-            # range and pandas Series) fail its Arrow conversion, so do not
-            # broaden this normalization to arbitrary iterables.
+            # Python vectors. Other merely iterable containers fail its Arrow
+            # conversion, so do not broaden this normalization arbitrarily.
             vector_values = vector
         else:
             vector_values = None
@@ -727,7 +509,8 @@ def _reject_empty_operation_bypass(table: Any | None, *, operation_id: str) -> N
     if has_operation_state or has_incomplete_state:
         raise VdbOperationConflict(
             f"VDB sink operation_id {operation_id!r} has durable state; "
-            "empty input cannot reconcile or verify that operation."
+            "retry the original operation with its original stream_operation_id; "
+            "empty input cannot verify that operation."
         )
     if not _bounded_create_is_finalized(table):
         raise VdbWriteNotFinalized(
@@ -845,73 +628,6 @@ def _validate_index_coverage(
             )
 
 
-@dataclass(frozen=True, slots=True)
-class _TableInventory:
-    versions: int = 0
-    fragments: int = 0
-    data_files: int = 0
-
-
-def _table_inventory(table: Any | None) -> _TableInventory:
-    if table is None:
-        return _TableInventory()
-    table.checkout_latest()
-    versions = table.list_versions()
-    current = next(
-        (version for version in versions if int(version["version"]) == int(table.version)),
-        versions[-1] if versions else {},
-    )
-    metadata = current.get("metadata") or {}
-    return _TableInventory(
-        versions=len(versions),
-        fragments=int(metadata.get("total_fragments", 0)),
-        data_files=int(metadata.get("total_data_files", 0)),
-    )
-
-
-def _write_report(
-    *,
-    operation_id: str,
-    outcome: str,
-    policy: VdbSinkPolicy,
-    stats: _StreamStats,
-    before: _TableInventory,
-    after: _TableInventory,
-    data_version: int | None,
-    final_version: int | None,
-    timings: dict[str, float],
-) -> VdbWriteReport:
-    normalized_timings = {phase: float(timings.get(phase, 0.0)) for phase in _TIMING_PHASES}
-    normalized_timings.update(timings)
-    write_seconds = normalized_timings["write"]
-    return VdbWriteReport(
-        operation_id=operation_id,
-        outcome=outcome,
-        configured_max_batch_bytes=int(policy.max_batch_bytes),
-        configured_prefetch_batches=int(policy.prefetch_batches),
-        input_batches=stats.input_batches,
-        input_rows=stats.input_rows,
-        input_bytes=stats.input_bytes,
-        max_input_batch_bytes=stats.max_input_batch_bytes,
-        output_batches=stats.output_batches,
-        rows_written=stats.rows_written,
-        logical_bytes=stats.logical_bytes,
-        max_batch_bytes=stats.max_batch_bytes,
-        max_pending_rows=stats.max_pending_rows,
-        versions_before=before.versions,
-        versions_after=after.versions,
-        fragments_before=before.fragments,
-        fragments_after=after.fragments,
-        data_files_before=before.data_files,
-        data_files_after=after.data_files,
-        write_rows_per_second=(stats.rows_written / write_seconds if write_seconds > 0 else 0.0),
-        write_bytes_per_second=(stats.logical_bytes / write_seconds if write_seconds > 0 else 0.0),
-        data_version=data_version,
-        final_version=final_version,
-        timings=normalized_timings,
-    )
-
-
 def _rows_at_version(uri: str, table_name: str, version: int | None) -> int:
     if version is None:
         return 0
@@ -928,16 +644,15 @@ def _drain_batches(first: pa.RecordBatch, rest: Iterator[pa.RecordBatch]) -> Non
         pass
 
 
-def write_lancedb_batches(
+def write_lancedb_records(
     vdb: Any,
-    batches: Iterable[Any],
+    records: Iterable[dict[str, Any]],
     *,
     operation_id: str,
-    policy: VdbSinkPolicy,
-    sidecar_spec: dict[str, Any] | None = None,
-    sidecar_lookup: dict[str, dict[str, Any]] | None = None,
-) -> VdbWriteReport:
-    """Consume many graph batches through one coordinated LanceDB mutation."""
+    max_batch_bytes: int,
+    optimize: bool,
+) -> None:
+    """Consume canonical NRL records through one coordinated LanceDB mutation."""
 
     import lancedb
 
@@ -953,12 +668,9 @@ def write_lancedb_batches(
         raise ValueError("operation_id must be a non-empty string")
 
     operation_id = str(operation_id)
-    started = time.perf_counter()
     stats = _StreamStats()
-    timings: dict[str, float] = {}
 
     with vdb._write_lock:
-        prepare_started = time.perf_counter()
         db = lancedb.connect(uri=vdb.uri)
         try:
             existing_table = db.open_table(vdb.table_name)
@@ -967,17 +679,14 @@ def write_lancedb_batches(
                 raise
             existing_table = None
         table_exists = existing_table is not None
-        inventory_before = _table_inventory(existing_table)
 
         stats.vector_dim = vdb.vector_dim
         if stats.vector_dim is None and existing_table is not None and not vdb.overwrite and not vdb.sparse:
             stats.vector_dim = _schema_vector_dim(_table_schema(existing_table))
 
-        canonical_rows = _canonical_rows(
-            batches,
+        canonical_rows = _lancedb_rows(
+            records,
             vdb=vdb,
-            sidecar_spec=sidecar_spec,
-            sidecar_lookup=sidecar_lookup,
             stats=stats,
         )
         try:
@@ -986,20 +695,9 @@ def write_lancedb_batches(
             first_canonical_row = None
             if stats.client_records == 0:
                 _reject_empty_operation_bypass(existing_table, operation_id=operation_id)
-                empty_version = int(existing_table.version) if existing_table is not None else None
-                timings["prepare"] = time.perf_counter() - prepare_started
-                timings["total"] = time.perf_counter() - started
-                return _write_report(
-                    operation_id=operation_id,
-                    outcome="empty_noop",
-                    policy=policy,
-                    stats=stats,
-                    before=inventory_before,
-                    after=inventory_before,
-                    data_version=empty_version,
-                    final_version=empty_version,
-                    timings=timings,
-                )
+                if existing_table is not None:
+                    vdb._remember_table(vdb.table_name, existing_table)
+                return
 
         def all_canonical_rows() -> Iterator[dict[str, Any]]:
             if first_canonical_row is not None:
@@ -1042,9 +740,8 @@ def write_lancedb_batches(
                 "fill_value": float(vdb.fill_value),
                 "validate_vector_length": bool(vdb.validate_vector_length),
                 "service_table_schema": bool(vdb._service_table_schema),
-                "optimize": bool(policy.optimize),
-                "max_batch_bytes": int(policy.max_batch_bytes),
-                "prefetch_batches": int(policy.prefetch_batches),
+                "optimize": optimize,
+                "max_batch_bytes": max_batch_bytes,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1057,7 +754,7 @@ def write_lancedb_batches(
         if existing_table is not None and not recovered_create and not _bounded_create_is_finalized(existing_table):
             raise VdbWriteNotFinalized(
                 f"LanceDB table {vdb.table_name!r} has an unfinished create operation; "
-                "retry or reconcile that operation before starting another write."
+                "retry the original operation with its original stream_operation_id before starting another write."
             )
         schema = (
             _with_create_identity(
@@ -1085,7 +782,6 @@ def write_lancedb_batches(
             request_fingerprint=request_fingerprint,
             mode=mode,
         )
-        timings["prepare"] = time.perf_counter() - prepare_started
 
         def all_rows() -> Iterator[dict[str, Any]]:
             if first_row is not None:
@@ -1095,7 +791,7 @@ def write_lancedb_batches(
         arrow_batches = _checked_batches(
             all_rows(),
             schema=schema,
-            max_batch_bytes=int(policy.max_batch_bytes),
+            max_batch_bytes=max_batch_bytes,
             stats=stats,
         )
         try:
@@ -1129,19 +825,8 @@ def write_lancedb_batches(
         if markers.state == "success":
             markers.cleanup_after_success(existing_table)
             assert_lancedb_table_ready(existing_table)
-            current_inventory = _table_inventory(existing_table)
-            timings["total"] = time.perf_counter() - started
-            return _write_report(
-                operation_id=operation_id,
-                outcome="already_succeeded",
-                policy=policy,
-                stats=stats,
-                before=inventory_before,
-                after=current_inventory,
-                data_version=markers.recorded_version,
-                final_version=markers.recorded_version,
-                timings=timings,
-            )
+            vdb._remember_table(vdb.table_name, existing_table)
+            return
 
         def all_batches() -> Iterator[pa.RecordBatch]:
             if first_batch is None:
@@ -1160,16 +845,12 @@ def write_lancedb_batches(
             table = lancedb.connect(uri=vdb.uri).open_table(vdb.table_name)
             table.checkout_latest()
             data_version = int(markers.recorded_version)
-            timings["write"] = 0.0
-            timings["time_to_data_commit"] = 0.0
         elif existing_table is not None and mode == "append" and stats.rows_written == 0:
             # Legacy append does not create a table version when every client
             # record is dropped, but it still proceeds through finalization.
             table = existing_table
             table.checkout_latest()
             data_version = int(table.version)
-            timings["write"] = 0.0
-            timings["time_to_data_commit"] = time.perf_counter() - started
             markers.mark_data(
                 table,
                 version=data_version,
@@ -1178,7 +859,6 @@ def write_lancedb_batches(
             )
         else:
             reader = pa.RecordBatchReader.from_batches(schema, all_batches())
-            write_started = time.perf_counter()
             try:
                 if existing_table is None:
                     table = db.create_table(
@@ -1206,8 +886,6 @@ def write_lancedb_batches(
                             "refusing to replay append because the commit outcome is indeterminate."
                         ) from exc
                 raise
-            timings["write"] = time.perf_counter() - write_started
-            timings["time_to_data_commit"] = time.perf_counter() - started
             # This tag is deliberately after the data mutation. If it fails,
             # the retained base marker makes a later append retry fail closed.
             markers.mark_data(
@@ -1217,7 +895,6 @@ def write_lancedb_batches(
                 digest=stats.digest,
             )
 
-        validate_started = time.perf_counter()
         fresh_table = lancedb.connect(uri=vdb.uri).open_table(vdb.table_name)
         fresh_schema = _table_schema(fresh_table)
         if not _schemas_have_same_fields(fresh_schema, expected_schema):
@@ -1231,24 +908,8 @@ def write_lancedb_batches(
                 f"LanceDB row-count validation failed for table {vdb.table_name!r}: "
                 f"expected {expected_rows}, got {actual_rows}."
             )
-        timings["validate"] = time.perf_counter() - validate_started
-
-        index_started = time.perf_counter()
-        timings["vector_index"] = 0.0
-        timings["fts_index"] = 0.0
         if vdb.build_index:
-            vdb.write_to_index(
-                None,
-                table=fresh_table,
-                index_type=vdb.index_type,
-                metric=vdb.metric,
-                num_partitions=vdb.num_partitions,
-                num_sub_vectors=vdb.num_sub_vectors,
-                hybrid=vdb.hybrid,
-                sparse=vdb.sparse,
-                fts_language=vdb.fts_language,
-                _phase_timings=timings,
-            )
+            vdb._maintain_indexes(None, fresh_table)
             fresh_table.checkout_latest()
             indexed_rows = int(fresh_table.count_rows())
             if indexed_rows != actual_rows:
@@ -1263,35 +924,36 @@ def write_lancedb_batches(
                 hybrid=bool(vdb.hybrid),
                 index_type=str(vdb.index_type),
             )
-        timings["index"] = time.perf_counter() - index_started
 
-        optimize_started = time.perf_counter()
-        if policy.optimize:
-            fresh_table.optimize()
-        timings["optimize"] = time.perf_counter() - optimize_started
-        fresh_table.checkout_latest()
-        final_validate_started = time.perf_counter()
-        final_schema = _table_schema(fresh_table)
-        if not _schemas_have_same_fields(final_schema, expected_schema):
-            raise RuntimeError(f"LanceDB schema validation failed after finalization for table {vdb.table_name!r}")
-        final_rows = int(fresh_table.count_rows())
-        if final_rows != expected_rows:
-            raise RuntimeError(
-                f"LanceDB row-count validation failed after finalization for table {vdb.table_name!r}: "
-                f"expected {expected_rows}, got {final_rows}."
-            )
-        if vdb.build_index:
-            _validate_index_coverage(
-                fresh_table,
-                rows=final_rows,
-                sparse=bool(vdb.sparse),
-                hybrid=bool(vdb.hybrid),
-                index_type=str(vdb.index_type),
-            )
-        timings["validate"] += time.perf_counter() - final_validate_started
-        final_version = int(fresh_table.version)
-        versions = {int(item["version"]) for item in fresh_table.list_versions()}
-        if data_version not in versions or final_version < data_version:
+        def validate_final_state() -> int:
+            fresh_table.checkout_latest()
+            final_schema = _table_schema(fresh_table)
+            if not _schemas_have_same_fields(final_schema, expected_schema):
+                raise RuntimeError(f"LanceDB schema validation failed after finalization for table {vdb.table_name!r}")
+            final_rows = int(fresh_table.count_rows())
+            if final_rows != expected_rows:
+                raise RuntimeError(
+                    f"LanceDB row-count validation failed after finalization for table {vdb.table_name!r}: "
+                    f"expected {expected_rows}, got {final_rows}."
+                )
+            if vdb.build_index:
+                _validate_index_coverage(
+                    fresh_table,
+                    rows=final_rows,
+                    sparse=bool(vdb.sparse),
+                    hybrid=bool(vdb.hybrid),
+                    index_type=str(vdb.index_type),
+                )
+            return int(fresh_table.version)
+
+        if optimize:
+            with vdb._index_lock:
+                fresh_table.checkout_latest()
+                fresh_table.optimize()
+                final_version = validate_final_state()
+        else:
+            final_version = validate_final_state()
+        if final_version < data_version:
             raise RuntimeError(
                 f"LanceDB version validation failed for table {vdb.table_name!r}: "
                 f"data_version={data_version}, final_version={final_version}."
@@ -1302,17 +964,4 @@ def write_lancedb_batches(
             rows=stats.rows_written,
             digest=stats.digest,
         )
-        inventory_after = _table_inventory(fresh_table)
-
-    timings["total"] = time.perf_counter() - started
-    return _write_report(
-        operation_id=operation_id,
-        outcome="success",
-        policy=policy,
-        stats=stats,
-        before=inventory_before,
-        after=inventory_after,
-        data_version=data_version,
-        final_version=final_version,
-        timings=timings,
-    )
+        vdb._remember_table(vdb.table_name, fresh_table)

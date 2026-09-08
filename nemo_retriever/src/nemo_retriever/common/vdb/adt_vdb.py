@@ -24,6 +24,7 @@ metadata-filtering section and its reference notebook.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -422,6 +423,19 @@ class VDB(ABC):
     def health(self) -> dict[str, Any]:
         """Return optional backend-specific operational health details."""
         return {}
+
+    def stream_ingest(self, records: Iterable[dict[str, Any]], **kwargs: Any) -> Any:
+        """Ingest a lazy stream of canonical NRL record dictionaries.
+
+        Implementations must consume ``records`` exactly once, synchronously,
+        and to exhaustion before returning. They must not retain the iterable.
+        This optional capability lets a backend own its bounded write lifecycle.
+        Backends that do not opt in retain the legacy global-batch ``run`` path.
+        """
+        raise UnsupportedVDBOperation(
+            f"{type(self).__name__} does not implement stream_ingest(); "
+            "streaming ingestion is not supported by this VDB backend."
+        )
 
     @abstractmethod
     def run(self, records):

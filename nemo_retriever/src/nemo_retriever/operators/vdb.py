@@ -6,17 +6,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
 import pandas as pd
 
-from nemo_retriever.common.vdb.adt_vdb import CollectionWriteContext, VDB
+from nemo_retriever.common.vdb.adt_vdb import CollectionWriteContext, UnsupportedVDBOperation, VDB
 from nemo_retriever.common.vdb.factory import get_vdb_op_cls
-from nemo_retriever.common.vdb.sink import VdbSinkPolicy
 
 from nemo_retriever.operators.abstract_operator import AbstractOperator
 from nemo_retriever.common.vdb.records import (
+    iter_client_vdb_records,
     normalize_retrieval_results,
     to_client_vdb_records,
     validate_collection_retrieval_results,
@@ -41,6 +41,39 @@ def _construct_vdb(
         raise ValueError("Either vdb or vdb_op is required.")
 
     return vdb if vdb is not None else get_vdb_op_cls(str(vdb_op))(**dict(vdb_kwargs or {}))
+
+
+def _iter_batch_rows(batches: Iterable[Any]) -> Iterator[dict[str, Any]]:
+    """Yield Python-owned graph rows from native executor batches one at a time."""
+
+    for batch in batches:
+        num_rows = getattr(batch, "num_rows", None)
+        slice_rows = getattr(batch, "slice", None)
+        to_pylist = getattr(batch, "to_pylist", None)
+        if isinstance(num_rows, int) and callable(slice_rows) and callable(to_pylist):
+            for row_index in range(num_rows):
+                rows = slice_rows(row_index, 1).to_pylist()
+                if rows and isinstance(rows[0], dict):
+                    yield rows[0]
+            continue
+
+        columns = getattr(batch, "columns", None)
+        itertuples = getattr(batch, "itertuples", None)
+        if columns is not None and callable(itertuples):
+            names = list(columns)
+            for values in itertuples(index=False, name=None):
+                yield dict(zip(names, values))
+            continue
+
+        if isinstance(batch, Mapping):
+            yield dict(batch)
+            continue
+
+        if batch is None:
+            continue
+        for row in batch:
+            if isinstance(row, Mapping):
+                yield dict(row)
 
 
 def _coerce_embedding_vector(value: Any) -> list[float] | None:
@@ -106,11 +139,6 @@ def query_vectors_from_embedded_dataframe(df: pd.DataFrame) -> list[list[float]]
 class IngestVdbOperator(AbstractOperator):
     """Upload already-embedded graph output through an nv-ingest-client VDB."""
 
-    #: The Ray executor may replace this operator's global ``map_batches``
-    #: call with one coordinated, bounded LanceDB stream. Subclasses whose
-    #: mutation semantics differ must opt out explicitly.
-    SUPPORTS_BOUNDED_LANCEDB_SINK: bool = True
-
     #: Ray batch mode: repartition to one block and one ``map_batches`` call so
     #: ``VDB.run`` sees the full dataset once (matches historical post-graph upload).
     REQUIRES_GLOBAL_BATCH: bool = True
@@ -121,20 +149,13 @@ class IngestVdbOperator(AbstractOperator):
         vdb: VDB | None = None,
         vdb_op: str | None = None,
         vdb_kwargs: dict[str, Any] | None = None,
-        sink_policy: VdbSinkPolicy | dict[str, Any] | None = None,
-        operation_id: str | None = None,
     ) -> None:
         merged = dict(vdb_kwargs or {})
         clean_kwargs, sidecar = split_sidecar_from_vdb_kwargs(merged)
-        resolved_policy = (
-            sink_policy if isinstance(sink_policy, VdbSinkPolicy) else VdbSinkPolicy(**dict(sink_policy or {}))
-        )
         super().__init__(
             vdb=vdb,
             vdb_op=vdb_op,
             vdb_kwargs=merged,
-            sink_policy=resolved_policy,
-            operation_id=operation_id,
         )
         self._vdb_kwargs = clean_kwargs
         self._sidecar_spec = sidecar
@@ -173,43 +194,47 @@ class IngestVdbOperator(AbstractOperator):
             self._vdb.run(records)
         return data
 
-    def supports_bounded_sink(self) -> bool:
-        """Return whether this operator can consume a bounded terminal stream."""
-        from nemo_retriever.common.vdb.lancedb import LanceDB
+    def supports_stream_ingest(self) -> bool:
+        """Return whether the configured VDB opts into canonical record streaming."""
 
-        return self.SUPPORTS_BOUNDED_LANCEDB_SINK and isinstance(self._vdb, LanceDB)
+        return type(self._vdb).stream_ingest is not VDB.stream_ingest
 
-    def consume_batches(
-        self,
-        batches: Iterable[Any],
-        *,
-        operation_id: str,
-        policy: VdbSinkPolicy,
-    ) -> Any:
-        """Consume Ray output batches through one coordinated backend write.
+    def stream_ingest(self, batches: Iterable[Any]) -> Any:
+        """Lazily convert executor batches and delegate one backend stream."""
 
-        This terminal-sink entry point is intentionally separate from
-        :meth:`process`: Ray blocks must not each invoke the complete VDB table
-        lifecycle. The legacy in-process path continues to use ``process``.
-        """
-        from nemo_retriever.common.vdb.lancedb import LanceDB
-        from nemo_retriever.common.vdb.sink import write_lancedb_batches
+        if not self.supports_stream_ingest():
+            raise UnsupportedVDBOperation(f"{type(self._vdb).__name__} does not implement stream_ingest()")
 
-        if not isinstance(policy, VdbSinkPolicy):
-            raise TypeError("policy must be a VdbSinkPolicy")
-        if not isinstance(self._vdb, LanceDB):
-            raise TypeError(
-                "Bounded batch ingestion is currently supported only by the LanceDB backend; "
-                f"got {type(self._vdb).__name__}."
+        records: Iterable[dict[str, Any]] = iter_client_vdb_records(_iter_batch_rows(batches))
+        if self._sidecar_spec is not None and self._sidecar_lookup is not None:
+            undecorated_records = records
+
+            def with_sidecar() -> Iterator[dict[str, Any]]:
+                for record in undecorated_records:
+                    decorated = apply_sidecar_metadata_to_client_batches(
+                        [[record]],
+                        lookup=self._sidecar_lookup,
+                        meta_fields=self._sidecar_spec["meta_fields"],
+                        join_key=self._sidecar_spec["meta_join_key"],
+                    )
+                    yield from decorated[0]
+
+            records = with_sidecar()
+
+        record_stream = records
+        exhausted = False
+
+        def required_records() -> Iterator[dict[str, Any]]:
+            nonlocal exhausted
+            yield from record_stream
+            exhausted = True
+
+        result = self._vdb.stream_ingest(required_records())
+        if not exhausted:
+            raise RuntimeError(
+                f"{type(self._vdb).__name__}.stream_ingest() returned before consuming the record stream"
             )
-        return write_lancedb_batches(
-            self._vdb,
-            batches,
-            operation_id=operation_id,
-            policy=policy,
-            sidecar_spec=self._sidecar_spec,
-            sidecar_lookup=self._sidecar_lookup,
-        )
+        return result
 
     def postprocess(self, data: Any, **kwargs: Any) -> Any:
         return data
@@ -234,8 +259,6 @@ class PutVdbOperator(IngestVdbOperator):
     overridden it are detected at construction time and fail fast rather
     than silently no-oping at runtime.
     """
-
-    SUPPORTS_BOUNDED_LANCEDB_SINK: bool = False
 
     def __init__(
         self,
@@ -269,6 +292,11 @@ class PutVdbOperator(IngestVdbOperator):
         if records and any(batch for batch in records):
             self._vdb.put(records, table_name=self._table_name, key=self._key)
         return data
+
+    def supports_stream_ingest(self) -> bool:
+        """Keep update-only put semantics on the historical global-batch path."""
+
+        return False
 
 
 class RetrieveVdbOperator(AbstractOperator):

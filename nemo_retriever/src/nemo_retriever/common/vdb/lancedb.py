@@ -8,6 +8,7 @@ import math
 import os
 import threading
 import time
+import uuid
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -51,6 +52,7 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_VECTOR_DIM: Final[int] = 2048
+_DEFAULT_STREAM_BATCH_BYTES: Final[int] = 256 << 20
 _VALID_ON_BAD_VECTORS: Final[FrozenSet[str]] = frozenset({"drop", "fill", "null", "error"})
 _RETRIEVAL_MODE_METADATA_KEY: Final[bytes] = b"retrieval_mode"
 _NEMO_RETRIEVER_RETRIEVAL_MODE_METADATA_KEY: Final[bytes] = b"nemo_retriever.retrieval_mode"
@@ -639,6 +641,9 @@ class LanceDB(VDB):
         build_index: bool | None = None,
         expiration_cleanup_enabled: bool = True,
         embedding_model_revision: str | None = None,
+        stream_batch_bytes: int = _DEFAULT_STREAM_BATCH_BYTES,
+        stream_optimize: bool = False,
+        stream_operation_id: str | None = None,
         **kwargs,
     ):
         create_index = kwargs.pop("create_index", None)
@@ -653,6 +658,14 @@ class LanceDB(VDB):
             raise ValueError(f"vector_dim must be positive; got {vector_dim}")
         if sparse and hybrid:
             raise ValueError("LanceDB sparse ingest cannot also be hybrid; pass only one retrieval mode.")
+        if isinstance(stream_batch_bytes, bool) or not isinstance(stream_batch_bytes, int) or stream_batch_bytes <= 0:
+            raise ValueError("stream_batch_bytes must be a positive integer")
+        if not isinstance(stream_optimize, bool):
+            raise ValueError("stream_optimize must be a boolean")
+        if stream_operation_id is not None:
+            if not isinstance(stream_operation_id, str) or not stream_operation_id.strip():
+                raise ValueError("stream_operation_id must be a non-empty string or None")
+            stream_operation_id = stream_operation_id.strip()
         self.uri = uri or "lancedb"
         self.overwrite = bool(overwrite)
         self.table_name = table_name
@@ -671,6 +684,9 @@ class LanceDB(VDB):
         self.fill_value = float(fill_value)
         self.validate_vector_length = bool(validate_vector_length)
         self.expiration_cleanup_enabled = bool(expiration_cleanup_enabled)
+        self.stream_batch_bytes = stream_batch_bytes
+        self.stream_optimize = stream_optimize
+        self.stream_operation_id = stream_operation_id
         self._service_table_schema = service_table_schema
         self._service_index_mode = str(service_index_mode) if service_index_mode is not None else None
         self._writes_since_optimize = 0
@@ -693,6 +709,11 @@ class LanceDB(VDB):
         # Row admission is serialized on its own short-lived lock so a caller
         # never waits on index maintenance to get its rows committed.
         self._write_lock = threading.Lock()
+        # A generated operation ID stays bound to a failed stream until that
+        # same instance completes its retry. The separate lock is required
+        # because write_lancedb_records acquires the non-reentrant write lock.
+        self._stream_lock = threading.Lock()
+        self._pending_stream_operation_id: str | None = None
         # LanceDB treats competing index commits as a conflict, so only one
         # rebuild may run at a time. Rebuilds are coalesced by generation:
         # a rebuild that starts after a batch was committed also covers it.
@@ -1215,20 +1236,13 @@ class LanceDB(VDB):
         hybrid = hybrid if hybrid is not None else self.hybrid
         sparse = sparse if sparse is not None else self.sparse
         fts_language = fts_language or self.fts_language
-        phase_timings = kwargs.pop("_phase_timings", None)
-        if isinstance(phase_timings, dict):
-            phase_timings.setdefault("vector_index", 0.0)
-            phase_timings.setdefault("fts_index", 0.0)
 
         if sparse:
             fts_index_start = time.perf_counter()
             sparse_rows = int(table.count_rows())
             table.create_fts_index("text", language=fts_language, replace=True)
             wait_for_column_index(table, "text", covered_rows=sparse_rows)
-            fts_duration = time.perf_counter() - fts_index_start
-            _record_timing("lancedb.fts_index_ready", fts_duration)
-            if isinstance(phase_timings, dict):
-                phase_timings["fts_index"] = fts_duration
+            _record_timing("lancedb.fts_index_ready", time.perf_counter() - fts_index_start)
             return
 
         num_rows = int(table.count_rows())
@@ -1273,19 +1287,76 @@ class LanceDB(VDB):
                 replace=True,
             )
             wait_for_column_index(table, "vector", covered_rows=num_rows)
-        vector_duration = time.perf_counter() - vector_index_start
-        _record_timing("lancedb.vector_index_ready", vector_duration)
-        if isinstance(phase_timings, dict):
-            phase_timings["vector_index"] = vector_duration
+            _record_timing("lancedb.vector_index_ready", time.perf_counter() - vector_index_start)
 
         if hybrid:
             fts_index_start = time.perf_counter()
             table.create_fts_index("text", language=fts_language, replace=True)
             wait_for_column_index(table, "text", covered_rows=num_rows)
-            fts_duration = time.perf_counter() - fts_index_start
-            _record_timing("lancedb.fts_index_ready", fts_duration)
-            if isinstance(phase_timings, dict):
-                phase_timings["fts_index"] = fts_duration
+            _record_timing("lancedb.fts_index_ready", time.perf_counter() - fts_index_start)
+
+    def stream_ingest(self, records: Iterable[dict[str, Any]], **kwargs: Any) -> None:
+        """Ingest canonical NRL records through one bounded LanceDB lifecycle."""
+
+        if kwargs:
+            unsupported = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unsupported LanceDB stream_ingest setting(s): {unsupported}")
+
+        from nemo_retriever.common.vdb.sink import write_lancedb_records
+
+        with self._stream_lock:
+            generated_operation_id = self.stream_operation_id is None
+            if generated_operation_id and self._pending_stream_operation_id is None:
+                self._pending_stream_operation_id = str(uuid.uuid4())
+            operation_id = self.stream_operation_id or self._pending_stream_operation_id
+            assert operation_id is not None
+
+            try:
+                write_lancedb_records(
+                    self,
+                    records,
+                    operation_id=operation_id,
+                    max_batch_bytes=self.stream_batch_bytes,
+                    optimize=self.stream_optimize,
+                )
+            except Exception as exc:
+                exc.add_note(f"LanceDB stream operation_id: {operation_id}")
+                raise
+            else:
+                if generated_operation_id:
+                    self._pending_stream_operation_id = None
+
+    def _reject_stream_controls_for_legacy_operation(self, operation: str) -> None:
+        active_controls = []
+        if self.stream_batch_bytes != _DEFAULT_STREAM_BATCH_BYTES:
+            active_controls.append(f"stream_batch_bytes={self.stream_batch_bytes}")
+        if self.stream_optimize:
+            active_controls.append("stream_optimize=True")
+        if self.stream_operation_id is not None:
+            active_controls.append("stream_operation_id")
+        if self._pending_stream_operation_id is not None:
+            active_controls.append("pending stream recovery")
+        if active_controls:
+            controls = ", ".join(active_controls)
+            raise ValueError(
+                f"LanceDB.{operation}() cannot use {controls}; these controls require "
+                "LanceDB.stream_ingest() through the streaming-ingest path. Retry any pending stream "
+                "through that path before using legacy mutations."
+            )
+
+    def _assert_legacy_table_ready(self, table_name: str) -> None:
+        """Refresh and reject a target with durable unfinished stream state."""
+
+        from nemo_retriever.common.vdb.sink import assert_lancedb_table_ready
+
+        try:
+            table = self._connect().open_table(table_name)
+        except ValueError as exc:
+            if _is_missing_lancedb_table_error(exc):
+                return
+            raise
+        assert_lancedb_table_ready(table)
+        self._remember_table(table_name, table)
 
     def run(self, records):
         """Commit rows, then bring the table indexes up to date.
@@ -1293,8 +1364,10 @@ class LanceDB(VDB):
         Row admission and index maintenance use separate locks. This keeps
         concurrent appends durable while serializing LanceDB index commits.
         """
+        self._reject_stream_controls_for_legacy_operation("run")
         service_write = self._service_index_mode is not None
         with self._write_lock:
+            self._assert_legacy_table_ready(self.table_name)
             table_existed = False
             if service_write:
                 db = self._connect()
@@ -1408,6 +1481,18 @@ class LanceDB(VDB):
         Returns the row counts dict from :func:`_create_lancedb_results`
         plus: ``put``.
         """
+        self._reject_stream_controls_for_legacy_operation("put")
+        with self._write_lock:
+            target_name = table_name or self.table_name
+            self._assert_legacy_table_ready(target_name)
+            return self._put(records, table_name=target_name, key=key)
+
+    def _put(
+        self,
+        records,
+        table_name: str,
+        key: str,
+    ) -> dict[str, int]:
         target_name = table_name or self.table_name
 
         if self.validate_vector_length and self.on_bad_vectors != "error":

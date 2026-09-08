@@ -23,8 +23,9 @@ Use this documentation to learn how [NeMo Retriever Library](overview.md) stores
 NeMo Retriever Library supports extracting text representations of various forms of content,
 and ingesting to a vector database. [LanceDB](https://lancedb.com/) is the vector database backend for storing and retrieving extracted embeddings.
 
-The data upload task (`vdb_upload`) pulls extraction results to the Python client,
-and then pushes them to LanceDB (embedded, in-process).
+The data upload task (`vdb_upload`) converts embedded graph rows to canonical
+vector database records and passes them to LanceDB. LanceDB runs embedded in the
+NeMo Retriever Library process.
 
 The vector database stores only the extracted text representations of ingested data.
 It does not store the embeddings for images.
@@ -105,7 +106,8 @@ Graph ingest returns a pandas `DataFrame` of flat rows. Use the following input 
 - `LanceDB.run()` expects nested client record batches: a `list` of batches, and each batch is a `list` of record dictionaries. Convert graph or `DataFrame` rows with `to_client_vdb_records()` before you call `run()`.
 - `LanceDB.run()` does not accept the graph `DataFrame` or a flat `list` of dictionaries from `DataFrame.to_dict("records")`.
 - `LanceDB.retrieval()` takes precomputed query vectors. Pass a `list` of embedding vectors whose length matches `vector_dim`. For query strings, use [`Retriever.query`](nemo-retriever-api-reference.md).
-- `IngestVdbOperator` accepts the same flat `DataFrame` or graph rows. It converts them with `to_client_vdb_records()` and then calls `run()`.
+- A direct `IngestVdbOperator` call accepts the same flat `DataFrame` or graph rows. It converts them with `to_client_vdb_records()` and then calls `run()`.
+- `RayDataExecutor.ingest()` can instead use a backend's optional `stream_ingest()` capability. `IngestVdbOperator` still performs canonical conversion, so no Ray, pandas, Arrow, or LanceDB objects cross the `VDB` interface.
 
 The following example uses a two-dimensional fixture so you can copy it without a GPU or embedding NIM:
 
@@ -213,6 +215,37 @@ NeMo Retriever graph operators [`IngestVdbOperator`](https://github.com/NVIDIA/N
 `GraphIngestor.vdb_upload()` selects LanceDB when `vdb_op` is omitted. Refer to [Upload to LanceDB](#upload-to-lancedb).
 
 To integrate another vector database, subclass [`VDB`](https://github.com/NVIDIA/NeMo-Retriever/blob/26.08.1/nemo_retriever/src/nemo_retriever/common/vdb/adt_vdb.py) and pass your operator instance as `vdb` (refer to [Build a Custom Vector Database Operator](https://github.com/NVIDIA/NeMo-Retriever/blob/26.08.1/examples/building_vdb_operator.ipynb)).
+
+`VDB.stream_ingest(records)` is an optional, non-abstract batch-ingest
+capability. Override it to receive a lazy iterable of canonical NeMo Retriever
+Library record dictionaries. Consume that single-pass iterable synchronously
+and to exhaustion before returning, and do not retain it. Existing custom
+backends do not need to implement the method. When a backend inherits the default unsupported implementation,
+`RayDataExecutor.ingest()` retains the global-batch `VDB.run(records)` path.
+
+LanceDB implements bounded Arrow packing, table mutation, retries, validation,
+indexing, and optimization behind this capability. `RayDataExecutor` owns Ray
+iteration, prefetch, cleanup, result retention, and ordering. `PutVdbOperator`
+does not use streaming ingest.
+
+For Ray batch ingestion, configure LanceDB streaming behavior in the LanceDB
+`vdb_kwargs`:
+
+| Setting | Behavior |
+| --- | --- |
+| `stream_batch_bytes` | Maximum Arrow bytes in one packed batch. The default is 256 MiB. |
+| `stream_optimize` | Runs LanceDB optimization after a successful streamed write. The default is `False`. |
+| `stream_operation_id` | Uses a stable retry identity. Omit it for an ID that the backend retains across a failed same-instance retry, or set it explicitly to resume after reconstructing the backend or restarting the process. |
+
+These LanceDB settings apply only to `RayDataExecutor.ingest()` streaming.
+Non-default streaming settings are rejected by legacy `run()` and `put()`
+execution instead of being ignored.
+
+`RayDataExecutor.build_dataset()` remains lazy and builds the complete legacy
+graph, including the global VDB stage. In-process and service execution do not
+select this streaming path. They continue through the existing VDB operator
+dispatch. Streaming is an automatic backend capability check, not a generic
+ingest or service setting.
 
 ### RAG Blueprint and partner vector stores { #rag-blueprint-and-partner-vector-stores }
 
