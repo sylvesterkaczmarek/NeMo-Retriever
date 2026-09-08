@@ -136,8 +136,8 @@ RetrievalModeOption = Annotated[
     typer.Option(
         "--retrieval-mode",
         help=(
-            "Expert LanceDB retrieval mode: auto, dense, hybrid, or sparse. Default auto inspects the table "
-            "and chooses the supported mode."
+            "Advanced override: auto, dense, hybrid, or sparse. Leave at auto to inspect the table and use "
+            "the supported default mode."
         ),
     ),
 ]
@@ -163,6 +163,13 @@ AgenticOption = Annotated[
     typer.Option(
         "--agentic",
         help="Run an LLM-driven agentic (ReAct) retrieval loop instead of the default retrieval pass.",
+    ),
+]
+IncludeUsageOption = Annotated[
+    bool,
+    typer.Option(
+        "--include-usage",
+        help="With --agentic, emit a {hits, usage} JSON envelope containing provider-reported LLM token usage.",
     ),
 ]
 AgenticLlmModelOption = Annotated[

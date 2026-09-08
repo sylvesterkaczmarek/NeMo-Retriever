@@ -82,6 +82,8 @@ By default, local ingest auto-detects supported input formats and writes to
 explicit high-level options when a task needs behavior beyond the current ingest
 defaults.
 
+Python `.vdb_upload()` and default `Retriever()` use the same table.
+
 The plain `retriever query` examples below apply to local and batch ingest output
 written to LanceDB. Use `retriever query service` to query a Retriever service.
 
@@ -154,27 +156,35 @@ retriever ingest ./data/multimodal_test.pdf \
   --ocr-invoke-url https://ai.api.nvidia.com/v1/cv/nvidia/nemotron-ocr-v2 \
   --table-structure-invoke-url https://ai.api.nvidia.com/v1/cv/nvidia/nemotron-table-structure-v1 \
   --embed-invoke-url https://integrate.api.nvidia.com/v1/embeddings \
-  --embed-model-name nvidia/llama-nemotron-embed-1b-v2
+  --embed-model-name nvidia/llama-nemotron-embed-vl-1b-v2
 ```
 
 `NVIDIA_API_KEY` is required only when those URLs point at hosted
 build.nvidia.com endpoints. `NGC_API_KEY` is used separately when pulling or
 running self-hosted NIM containers.
 
-For NVIDIA inference hub rerank models that expose the Cohere-style rerank
-route, pass the full `/v1/rerank` URL and the model name shown in the hub
-snippet:
+To rerank local query results with the hosted vision-language reranker, pass the
+NVIDIA-hosted `/reranking` endpoint and model. Use the same `NVIDIA_API_KEY` that
+authorizes the hosted embedding URL:
 
 ```bash
-export NGC_INFERENCE_API_KEY=...
-
 retriever query "What is in this document?" \
   --embed-invoke-url https://integrate.api.nvidia.com/v1/embeddings \
-  --embed-model-name nvidia/llama-nemotron-embed-1b-v2 \
-  --reranker-invoke-url https://inference-api.nvidia.com/v1/rerank \
-  --reranker-model-name nvidia/nvidia/llama-3.2-nv-rerankqa-1b-v2 \
-  --reranker-api-key-env NGC_INFERENCE_API_KEY
+  --embed-model-name nvidia/llama-nemotron-embed-vl-1b-v2 \
+  --reranker-invoke-url https://ai.api.nvidia.com/v1/retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking \
+  --reranker-model-name nvidia/llama-nemotron-rerank-vl-1b-v2 \
+  --reranker-api-key-env NVIDIA_API_KEY
 ```
+
+Passing `--rerank` without `--reranker-invoke-url` uses the local GPU reranker,
+not this hosted endpoint.
+
+A Cohere-style `/v1/rerank` URL is a gateway route, not an NVIDIA-hosted NIM
+endpoint. Pass the full URL that your gateway exposes, for example
+`https://<your-gateway>/v1/rerank`, and the model name that gateway expects.
+Set `--reranker-api-key-env` to an environment variable that holds a credential
+issued by that gateway. A gateway that expects a LiteLLM virtual key that starts
+with `sk-` rejects NVIDIA `nvapi-` keys and NGC keys.
 
 ### Query result controls
 
@@ -228,8 +238,10 @@ output are not used for content-type matching.
 
 `--agentic` swaps the single dense pass for an LLM-driven ReAct loop: the agent
 issues several retrieval sub-queries, fuses the candidates, and selects a final
-ranking. It searches the same LanceDB table built by `retriever ingest`, so it is
-a drop-in alternative to standard retrieval.
+ranking. It searches the same LanceDB table built by `retriever ingest`. You can
+reuse the same table, embedding flags, and `--top-k` as standard retrieval.
+The JSON hit shape is not a drop-in replacement for dense `retriever query`
+output.
 
 By default, agentic retrieval runs the agent LLM in process with local vLLM and
 `nemotron-8b` (`nvidia/Llama-3.1-Nemotron-Nano-8B-v1`). This requires a CUDA GPU
@@ -250,15 +262,64 @@ retriever query "summarize the deployment options" \
   --agentic-react-max-steps 5
 ```
 
-Agentic mode returns the agent's ranked documents as JSON, with the same hit
-fields as the dense path (`text`, `metadata`, `source`, `page_number`, and
-related) plus `doc_id`, `rank`, and the stage that produced the ranking
-(`final_results`, `rrf`, or `selection_agent`). Hit fields are rehydrated at the
-end of the loop from the retrieval hop that returned the document, so a document
-the agent named without retrieving it reports null hit fields. It reuses the same
-`--top-k`, `--lancedb-uri`, `--table-name`, `--embed-invoke-url`, and
-`--embed-model-name` options as standard retrieval. Agentic retrieval uses the
-selected table's model automatically when `--embed-model-name` is omitted.
+Agentic mode returns the agent's ranked documents as JSON. The dense path
+projects each hit to five fields: `modality`, `page_number`, `score`,
+`source`, and `text`. Agentic mode does not use that projection. It prints
+the internal hit dictionary plus `doc_id`, `rank`, and `result_source`.
+`result_source` is `final_results`, `rrf`, or `selection_agent`, depending
+on which stage produced the ranking.
+`modality` and `score` exist only on the dense path. Fields such as
+`content_type`, `_distance`, `metadata`, `path`, `pdf_basename`,
+`pdf_page`, and `source_id` appear on the agentic path when the retrieval
+hop returned them.
+
+Hit fields are rehydrated at the end of the loop from the retrieval hop
+that returned the document. When the agent names a document that no
+retrieval hop returned, the object contains only `doc_id`, `rank`, and
+`result_source`. Classic hit keys such as `text` and `source` are
+absent. They are not present with null values.
+
+Agentic retrieval reuses the same `--top-k`, `--lancedb-uri`, `--table-name`,
+`--embed-invoke-url`, and `--embed-model-name` options as standard retrieval.
+Agentic retrieval uses the selected table's model automatically when
+`--embed-model-name` is omitted.
+
+The default `retriever query --agentic` output remains a JSON hits list. Add
+`--include-usage` to print a JSON object with `hits` and exact provider-reported
+LLM usage:
+
+```bash
+retriever query "how does the ingestion pipeline handle tables?" \
+  --agentic \
+  --include-usage
+```
+
+```json
+{
+  "hits": [
+    {
+      "doc_id": "ingestion-guide",
+      "rank": 1,
+      "result_source": "final_results"
+    }
+  ],
+  "usage": {
+    "input_tokens": 1250,
+    "cache_tokens": 400,
+    "output_tokens": 184,
+    "total_tokens": 1434
+  }
+}
+```
+
+The `usage` object reports observed cache reads as `cache_tokens` and can also
+include `stages`, which preserves the provider-reported breakdown for the ReAct
+and final-selection calls, including cache creation. When a provider reports
+uncached, cache-creation, and cache-read input separately, `input_tokens`
+includes all three counters; cache is not added again to `total_tokens`.
+`cache_tokens` is `null` when no stage reports cache usage. The output sets
+`usage` to `null` when the LLM provider does not report it. This flag applies
+only with `--agentic`; classic query behavior and output are unchanged.
 
 **How it works.** Each agentic query runs `Query -> ReActAgentOperator -> (RRF
 fusion) -> SelectionAgentOperator -> ranked results`:
@@ -269,7 +330,8 @@ fusion) -> SelectionAgentOperator -> ranked results`:
 - `RRFAggregatorOperator` fuses candidates from the loop's multiple searches with
   reciprocal rank fusion.
 - `SelectionAgentOperator` runs a final LLM selection pass over the fused set and
-  emits the ranked document IDs, which are then rehydrated into full hits.
+  emits ranked document IDs. Those IDs are then rehydrated from the retrieval-hop
+  hit dictionary.
 
 Agentic-only knobs (apply only with `--agentic`):
 
@@ -302,6 +364,8 @@ Agentic-only knobs (apply only with `--agentic`):
   calls; omit to use the endpoint/model default (`0.0` = greedy). Local and
   non-NVIDIA OpenAI-compatible endpoints allow up to `2.0`; NVIDIA-hosted
   endpoints allow up to `1.0`.
+- `--include-usage` (default: off) — replace the default hits-list output with
+  an object that contains `hits` and provider-reported LLM `usage`.
 
 <!-- --8<-- [end:quickstart] -->
 
@@ -317,9 +381,9 @@ These options apply to `retriever ingest`, `retriever ingest local`, and
 | `DOCUMENTS...` | required | Files, directories, or shell globs. Supported file families are detected automatically. |
 | `--profile` | `auto` | `auto` uses manifest-routed ingest and selects `pdfium_hybrid` for PDFs. `fast-text` selects `pdfium` and disables Page Elements, image, table, and chart extraction for text-only PDFs. |
 | `--lancedb-uri` | `lancedb` | LanceDB database URI. |
-| `--table-name` | `nemo-retriever` | LanceDB table name. Must match query-time storage flags. |
+| `--table-name` | `nemo-retriever` | LanceDB table name. Must match query-time storage flags. Python `.vdb_upload()` and default `Retriever()` use the same default. |
 | `--overwrite/--append` | overwrite | Overwrite the table by default; use `--append` to add rows. |
-| `--index-mode` | `dense` | Dense vector index by default; `hybrid` also builds BM25/FTS and `sparse` builds an FTS-only table. |
+| `--index-mode` | `auto` | Recommended: leave this unset. `auto` creates a hybrid vector + BM25/FTS configuration for new tables and preserves an existing table on append. Use `dense`, `hybrid`, or `sparse` only for explicit experiments or specialized deployments. |
 | `--method` | profile default | PDF extraction method: `pdfium`, `pdfium_hybrid`, `ocr`, or `nemotron_parse`. The `auto` profile selects `pdfium_hybrid`; `fast-text` selects `pdfium`. An explicit value overrides the profile-selected method. |
 | `--extract-text`, `--extract-tables`, `--extract-charts` | planner default | Enable or disable extraction families. |
 | `--ocr-version` | planner default | OCR engine version for local extraction. |
