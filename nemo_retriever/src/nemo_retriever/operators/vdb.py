@@ -197,7 +197,8 @@ class IngestVdbOperator(AbstractOperator):
     def supports_stream_ingest(self) -> bool:
         """Return whether the configured VDB opts into canonical record streaming."""
 
-        return type(self._vdb).stream_ingest is not VDB.stream_ingest
+        implementation = getattr(self._vdb.stream_ingest, "__func__", self._vdb.stream_ingest)
+        return implementation is not VDB.stream_ingest
 
     def stream_ingest(self, batches: Iterable[Any]) -> Any:
         """Lazily convert executor batches and delegate one backend stream."""

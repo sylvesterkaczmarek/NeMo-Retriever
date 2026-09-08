@@ -130,6 +130,9 @@ optional VDB capability. It receives canonical record dictionaries and owns
 Arrow packing and schemas, the byte limit, one table mutation, durable operation
 tags, retry and version validation, index coverage, and optional optimization.
 Ray remains responsible only for producing and retaining ordered input batches.
+Scheme-less local paths and authority-free `file:///` URIs also share a
+crash-released table lock across backend instances and processes; other URIs
+retain the legacy global-batch path.
 
 Common constructor arguments include:
 
@@ -144,7 +147,7 @@ Common constructor arguments include:
 | `on_bad_vectors`| `drop`, `fill`, `null`, or `error` |
 | `stream_batch_bytes` | Maximum Arrow bytes per packed streaming batch (default 256 MiB) |
 | `stream_optimize` | Run LanceDB optimization after a streaming write (default `False`) |
-| `stream_operation_id` | Optional stable operation ID for retry and recovery; generated when omitted |
+| `stream_operation_id` | Optional stable operation ID; generated and retained for failed same-instance retries when omitted; set explicitly for backend reconstruction or process restart |
 
 ---
 

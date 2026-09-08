@@ -2,6 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import json
 import logging
 import math
@@ -11,12 +12,16 @@ import time
 import uuid
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Final, FrozenSet
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import lancedb
 import pyarrow as pa
 import pyarrow.compute as pc
+from filelock import FileLock
 
 from nemo_retriever.common.schemas.collections import (
     CollectionCreateRequest,
@@ -32,6 +37,7 @@ from nemo_retriever.common.vdb.adt_vdb import (
     VDB,
     CollectionWriteContext,
     CollectionWriteResult,
+    UnsupportedVDBOperation,
 )
 from nemo_retriever.common.vdb.hybrid_fusion import (
     HybridFusionPolicy,
@@ -63,6 +69,39 @@ _MISSING_FTS_POSITIONS_ERROR: Final[str] = "position is not found but required f
 # optimize() folds them into FTS. These thresholds follow its recommended cadence.
 _SERVICE_OPTIMIZE_WRITE_THRESHOLD: Final[int] = 20
 _SERVICE_OPTIMIZE_ROW_THRESHOLD: Final[int] = 100_000
+
+
+def _filesystem_lancedb_path(uri: str) -> Path | None:
+    """Resolve an embedded LanceDB path, including a local ``file://`` URI."""
+
+    uri_text = os.fspath(uri)
+    parsed = urlparse(uri_text)
+    if parsed.scheme == "file":
+        if parsed.netloc:
+            return None
+        return Path(url2pathname(parsed.path))
+    if "://" not in uri_text:
+        return Path(uri_text)
+    return None
+
+
+def _is_filesystem_lancedb_uri(uri: str) -> bool:
+    """Return whether ``uri`` names the embedded filesystem implementation."""
+
+    return _filesystem_lancedb_path(uri) is not None
+
+
+def _stream_lock_path(uri: str, table_name: str) -> Path:
+    """Return one process-shared lock file for a local LanceDB table."""
+
+    root = _filesystem_lancedb_path(uri)
+    if root is None:
+        raise ValueError("A process-shared stream lock requires a filesystem-backed LanceDB URI")
+    root = root.expanduser().resolve()
+    lock_dir = root / ".nemo-retriever-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    table_token = hashlib.sha256(table_name.encode("utf-8")).hexdigest()[:24]
+    return lock_dir / f"stream-{table_token}.lock"
 
 
 def _without_fts_phrase_syntax(query_text: str) -> str:
@@ -687,6 +726,11 @@ class LanceDB(VDB):
         self.stream_batch_bytes = stream_batch_bytes
         self.stream_optimize = stream_optimize
         self.stream_operation_id = stream_operation_id
+        # Remote object stores do not expose an equivalent conditional-append
+        # primitive in LanceDB. Bind the inherited unsupported hook so the
+        # operator selects the historical global-batch path for those URIs.
+        if not _is_filesystem_lancedb_uri(self.uri) and type(self).stream_ingest is LanceDB.stream_ingest:
+            self.stream_ingest = VDB.stream_ingest.__get__(self, type(self))
         self._service_table_schema = service_table_schema
         self._service_index_mode = str(service_index_mode) if service_index_mode is not None else None
         self._writes_since_optimize = 0
@@ -1296,35 +1340,65 @@ class LanceDB(VDB):
             _record_timing("lancedb.fts_index_ready", time.perf_counter() - fts_index_start)
 
     def stream_ingest(self, records: Iterable[dict[str, Any]], **kwargs: Any) -> None:
-        """Ingest canonical NRL records through one bounded LanceDB lifecycle."""
+        """Ingest canonical records through one bounded LanceDB lifecycle.
+
+        Parameters
+        ----------
+        records
+            A single-pass iterable of canonical NeMo Retriever record
+            dictionaries. It is consumed synchronously and to exhaustion.
+        **kwargs
+            Reserved for interface compatibility. Any supplied key is rejected.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        UnsupportedVDBOperation
+            If the LanceDB URI is not backed by the local filesystem.
+        TypeError
+            If an unsupported keyword setting is supplied.
+        ValueError
+            If records or configured streaming controls are invalid.
+        RuntimeError
+            If mutation, recovery, validation, indexing, or optimization fails.
+        """
 
         if kwargs:
             unsupported = ", ".join(sorted(kwargs))
             raise TypeError(f"Unsupported LanceDB stream_ingest setting(s): {unsupported}")
+        if not _is_filesystem_lancedb_uri(self.uri):
+            raise UnsupportedVDBOperation(
+                "LanceDB.stream_ingest() requires a filesystem-backed URI so writers can share "
+                "a crash-released table lock. Non-filesystem URIs retain the legacy global-batch path."
+            )
 
         from nemo_retriever.common.vdb.sink import write_lancedb_records
 
         with self._stream_lock:
-            generated_operation_id = self.stream_operation_id is None
-            if generated_operation_id and self._pending_stream_operation_id is None:
-                self._pending_stream_operation_id = str(uuid.uuid4())
-            operation_id = self.stream_operation_id or self._pending_stream_operation_id
-            assert operation_id is not None
+            with FileLock(_stream_lock_path(self.uri, self.table_name)):
+                generated_operation_id = self.stream_operation_id is None
+                if generated_operation_id and self._pending_stream_operation_id is None:
+                    self._pending_stream_operation_id = str(uuid.uuid4())
+                operation_id = self.stream_operation_id or self._pending_stream_operation_id
+                assert operation_id is not None
 
-            try:
-                write_lancedb_records(
-                    self,
-                    records,
-                    operation_id=operation_id,
-                    max_batch_bytes=self.stream_batch_bytes,
-                    optimize=self.stream_optimize,
-                )
-            except Exception as exc:
-                exc.add_note(f"LanceDB stream operation_id: {operation_id}")
-                raise
-            else:
-                if generated_operation_id:
-                    self._pending_stream_operation_id = None
+                try:
+                    write_lancedb_records(
+                        self,
+                        records,
+                        operation_id=operation_id,
+                        max_batch_bytes=self.stream_batch_bytes,
+                        optimize=self.stream_optimize,
+                    )
+                except Exception as exc:
+                    exc.add_note(f"LanceDB stream operation_id: {operation_id}")
+                    raise
+                else:
+                    if generated_operation_id:
+                        self._pending_stream_operation_id = None
 
     def _reject_stream_controls_for_legacy_operation(self, operation: str) -> None:
         active_controls = []

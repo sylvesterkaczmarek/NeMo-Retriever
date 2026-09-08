@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -13,9 +15,11 @@ import pytest
 
 lancedb = pytest.importorskip("lancedb", minversion="0.34.0")
 
+from nemo_retriever.common.vdb.adt_vdb import UnsupportedVDBOperation
 from nemo_retriever.common.vdb.lancedb import LanceDB
 from nemo_retriever.common.vdb.sink import OversizedVdbRowError, VdbWriteNotFinalized
 from nemo_retriever.common.vdb.sink_operation import CommitOutcomeUnknown, VdbOperationConflict
+from nemo_retriever.operators.vdb import IngestVdbOperator
 
 
 def _record(
@@ -62,6 +66,51 @@ def _records(
         )
         for row_id in range(start, stop)
     ]
+
+
+def _stream_writer_process(
+    uri: str,
+    records: list[dict[str, Any]],
+    *,
+    block_in_add: bool,
+    add_entered: Any,
+    lock_attempted: Any | None = None,
+    lock_acquired: Any | None = None,
+) -> None:
+    """Run one real LanceDB stream write in a spawned process."""
+
+    if lock_attempted is not None:
+        assert lock_acquired is not None
+        from nemo_retriever.common.vdb import lancedb as lancedb_module
+
+        original_acquire = lancedb_module.FileLock.acquire
+
+        def observed_acquire(self, *args, **kwargs):
+            lock_attempted.set()
+            result = original_acquire(self, *args, **kwargs)
+            lock_acquired.set()
+            return result
+
+        lancedb_module.FileLock.acquire = observed_acquire
+
+    table_type = type(lancedb.connect(uri).open_table("chunks"))
+    original_add = table_type.add
+
+    def observed_add(self, *args, **kwargs):
+        add_entered.set()
+        if block_in_add and not threading.Event().wait(timeout=30):
+            raise TimeoutError("timed out waiting to release the first LanceDB add")
+        return original_add(self, *args, **kwargs)
+
+    table_type.add = observed_add
+    LanceDB(
+        uri=uri,
+        table_name="chunks",
+        vector_dim=2,
+        overwrite=False,
+        build_index=False,
+        stream_operation_id="shared-append",
+    ).stream_ingest(records)
 
 
 def _backend(uri: Path, **overrides: Any) -> LanceDB:
@@ -477,6 +526,107 @@ def test_default_operation_id_recovers_finalization_and_clears_after_success(
     monkeypatch.setattr(table_type, "add", original_add)
     backend.stream_ingest(_records(20, 22))
     assert _state(tmp_path)[0][-2:] == ["row-20", "row-21"]
+
+
+def test_same_operation_is_exactly_once_across_concurrent_backend_instances(
+    tmp_path: Path,
+) -> None:
+    _backend(tmp_path, stream_operation_id="seed").stream_ingest(_records(0, 2))
+    context = mp.get_context("spawn")
+    first_add_entered = context.Event()
+    second_add_entered = context.Event()
+    second_lock_attempted = context.Event()
+    second_lock_acquired = context.Event()
+    first = context.Process(
+        target=_stream_writer_process,
+        args=(str(tmp_path), _records(10, 14)),
+        kwargs={
+            "block_in_add": True,
+            "add_entered": first_add_entered,
+        },
+    )
+    second = context.Process(
+        target=_stream_writer_process,
+        args=(str(tmp_path), _records(10, 14)),
+        kwargs={
+            "block_in_add": False,
+            "add_entered": second_add_entered,
+            "lock_attempted": second_lock_attempted,
+            "lock_acquired": second_lock_acquired,
+        },
+    )
+    first.start()
+    try:
+        assert first_add_entered.wait(timeout=30)
+        second.start()
+        assert second_lock_attempted.wait(timeout=30)
+        assert not second_lock_acquired.wait(timeout=1)
+        assert not second_add_entered.is_set()
+        first.terminate()
+        first.join(timeout=10)
+        assert not first.is_alive()
+        assert second_lock_acquired.wait(timeout=30)
+        assert second_add_entered.wait(timeout=30)
+        second.join(timeout=30)
+        assert not second.is_alive()
+        assert second.exitcode == 0
+    finally:
+        for process in (first, second):
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+
+    assert _state(tmp_path)[0] == [
+        "row-0",
+        "row-1",
+        "row-10",
+        "row-11",
+        "row-12",
+        "row-13",
+    ]
+
+
+@pytest.mark.parametrize(
+    "uri",
+    ["s3://example/retriever", "file://localhost/tmp/retriever"],
+)
+def test_nonfilesystem_lancedb_retains_fallback_without_consuming_stream(uri: str) -> None:
+    backend = LanceDB(uri=uri, table_name="chunks")
+    assert not IngestVdbOperator(vdb=backend).supports_stream_ingest()
+    pulled = False
+
+    def records() -> Iterator[dict[str, Any]]:
+        nonlocal pulled
+        pulled = True
+        yield _record(0)
+
+    with pytest.raises(UnsupportedVDBOperation, match="not supported by this VDB backend"):
+        backend.stream_ingest(records())
+    assert not pulled
+
+    class RemoteCapableLanceDB(LanceDB):
+        def stream_ingest(self, records: Iterator[dict[str, Any]], **kwargs: Any) -> None:
+            list(records)
+
+    assert IngestVdbOperator(vdb=RemoteCapableLanceDB(uri=uri, table_name="chunks")).supports_stream_ingest()
+
+
+def test_file_uri_uses_the_bounded_streaming_path(tmp_path: Path) -> None:
+    uri = tmp_path.as_uri()
+    backend = LanceDB(
+        uri=uri,
+        table_name="chunks",
+        vector_dim=2,
+        build_index=False,
+        stream_operation_id="file-uri",
+    )
+
+    assert IngestVdbOperator(vdb=backend).supports_stream_ingest()
+    backend.stream_ingest(_records(0, 2))
+    assert sorted(lancedb.connect(uri).open_table("chunks").to_arrow().column("id").to_pylist()) == [
+        "row-0",
+        "row-1",
+    ]
 
 
 def test_lost_append_commit_acknowledgement_fails_closed(

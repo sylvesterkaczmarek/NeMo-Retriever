@@ -228,6 +228,10 @@ indexing, and optimization behind this capability. `RayDataExecutor` owns Ray
 iteration, prefetch, cleanup, result retention, and ordering. `PutVdbOperator`
 does not use streaming ingest.
 
+The bounded path applies to scheme-less local LanceDB paths and authority-free
+`file:///` URIs, where backend instances and processes share a crash-released
+table lock. Other URIs retain the existing global-batch path.
+
 For Ray batch ingestion, configure LanceDB streaming behavior in the LanceDB
 `vdb_kwargs`:
 
@@ -237,9 +241,10 @@ For Ray batch ingestion, configure LanceDB streaming behavior in the LanceDB
 | `stream_optimize` | Runs LanceDB optimization after a successful streamed write. The default is `False`. |
 | `stream_operation_id` | Uses a stable retry identity. Omit it for an ID that the backend retains across a failed same-instance retry, or set it explicitly to resume after reconstructing the backend or restarting the process. |
 
-These LanceDB settings apply only to `RayDataExecutor.ingest()` streaming.
-Non-default streaming settings are rejected by legacy `run()` and `put()`
-execution instead of being ignored.
+These LanceDB settings apply only to `LanceDB.stream_ingest()`, which
+`RayDataExecutor.ingest()` selects automatically for an eligible backend.
+Legacy `run()` and `put()` calls reject non-default streaming settings
+instead of ignoring them.
 
 `RayDataExecutor.build_dataset()` remains lazy and builds the complete legacy
 graph, including the global VDB stage. In-process and service execution do not
