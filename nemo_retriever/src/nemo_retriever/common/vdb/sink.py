@@ -46,7 +46,10 @@ class VdbWriteNotFinalized(RuntimeError):
 def assert_lancedb_table_ready(table: Any) -> None:
     """Reject reads while a bounded sink operation is pending finalization."""
 
-    tags = table.tags.list()
+    list_tags = getattr(getattr(table, "tags", None), "list", None)
+    if not callable(list_tags):
+        return
+    tags = list_tags()
     incomplete = sorted(name for name in tags if name.startswith(("nemo_sink_pending_", "nemo_sink_data_")))
     if incomplete:
         raise VdbWriteNotFinalized(
